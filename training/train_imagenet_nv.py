@@ -24,6 +24,7 @@ import copy
 import dataloader
 import experimental_utils
 import dist_utils
+import svd
 from logger import TensorboardLogger, FileLogger
 from meter import AverageMeter, NetworkMeter, TimeMeter
 
@@ -106,7 +107,9 @@ def main():
     # each process running uses the distributed data parallel from
     # starts on each device not sure how this is synced 
     # but len device_ids will be 1
-    if args.distributed: model = dist_utils.DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+    #NOTE: We don't need distributed data paralle for the reason that we can't
+    # do an all reduce so actual model will not be shared
+    # if args.distributed: model = dist_utils.DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
 
     global model_params, master_params
@@ -172,7 +175,7 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
-
+    atomo = svd.SVD(rank=20, random_sample=False)
     # switch to train mode
     model.train()
     for i,(input,target) in enumerate(trn_loader):
@@ -189,7 +192,19 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         if args.fp16:
             loss = loss*args.loss_scale
             model.zero_grad()
+            # since model is not part of data parallel  so it will be local
+            # also no where there is a gradient calculation call on master or
+            # model params so hopefully we are save
             loss.backward()
+            # According to me this is where atomo code has to be added
+            for name, param in model.named_parameters():
+                grad_val = param.grad.data
+                encoded_dict = atomo.encode(grad_val)
+                # create a tensor for doing all gather
+                
+
+
+
             model_grads_to_master_grads(model_params, master_params)
             for param in master_params: param.grad.data = param.grad.data/args.loss_scale
             optimizer.step()
