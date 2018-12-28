@@ -197,7 +197,7 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
             # also no where there is a gradient calculation call on master or
             # model params so hopefully we are save
             loss.backward()
-            # According to me this is where atomo code has to be added
+            # beginning of ATOMO code
             for name, param in model.named_parameters():
                 grad_val = param.grad.data
                 # converting grad val to cpu to use with current version of
@@ -207,6 +207,13 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
                     'u','s','vT', 'orig_size'])
                 # the assumption is that this is a numpy array let's prep all
                 # this for all-gather
+                # TODO: Check about batch norm it's fp32 while rest is fp16
+                # TODO: Based on name do an all reduce for batch norm and no
+                # atomo
+                # TODO: There is a broadcast missing for buffers like batch
+                # norm it should be done at forward pass 
+                # shouldn't break the code but could effect the accuracy
+                # refer _sync_param for forward function in the DDP code
                 u = [torch.from_numpy(u).cuda(args.local_rank)]
                 s = [torch.from_numpy(s).cuda(args.local_rank)]
                 vT = [torch.from_numpy(vT).cuda(args.local_rank)]
@@ -330,6 +337,8 @@ def distributed_predict(input, target, model, criterion):
 
     if batch_size:
         with torch.no_grad():
+            # this should not be a problem 
+            # assuming that self.training flags is at work here
             output = model(input)
             loss = criterion(output, target).data
         # measure accuracy and record loss
