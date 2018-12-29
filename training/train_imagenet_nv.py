@@ -249,6 +249,50 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         else:
             optimizer.zero_grad()
             loss.backward()
+            # atomo implementation for non fp16 case
+            for name, param in model.named_parameters():
+                grad_val = param.grad.data
+                # converting grad val to cpu to use with current version of
+                grad_val = grad_val.cpu().numpy()
+                encoded_dict = atomo.encode(grad_val)
+                u, s, vT, orig_size = (encoded_dict[key] for key in [
+                    'u','s','vT', 'orig_size'])
+                # the assumption is that this is a numpy array let's prep all
+                # this for all-gather
+                # TODO: Based on name do an all reduce for batch norm and no
+                # atomo
+                # TODO: There is a broadcast missing for buffers like batch
+                # norm it should be done at forward pass 
+                # shouldn't break the code but could effect the accuracy
+                # refer _sync_param for forward function in the DDP code
+                
+                u = [torch.from_numpy(u).cuda(args.local_rank)]
+                s = [torch.from_numpy(s).cuda(args.local_rank)]
+                vT = [torch.from_numpy(vT).cuda(args.local_rank)]
+                # based on the experiments and documentations we have to
+                # all_gather the three tensors differently
+                gather_u = [[ torch.zeros(u[0].shape).cuda(args.local_rank) for x in
+                             range(total_processes)]]
+                # TODO: Make this async for pytorch 1.0
+                dist.all_gather_multigpu(gather_u, u)
+                gather_s = [[ torch.zeros(s[0].shape).cuda(args.local_rank) for x in 
+                             range(total_processes)]]
+                dist.all_gather_multigpu(gather_s, s)
+                gather_vT = [[ torch.zeros(vT[0].shape).cuda(args.local_rank) for x in range(total_processes)]]
+
+                dist.all_gather_multigpu(gather_vT, vT)
+
+                collected_grad = torch.zeros(orig_size)
+                for idx, u_vec in enumerate(gather_u):
+                    s_vec = gather_s[idx]
+                    vT_vec = gather_vT[idx]
+                    grad = torch.mm(torch.mm(u_vec, torch.diag(s_vec)), vT_vec)
+                    grad = grad.view(orig_size)
+                    collected_grad += grad
+                # avg the gradients
+                collected_grad /= total_processes
+                param.grad.data = collected_grad
+
             optimizer.step()
 
         # Train batch done. Logging results
