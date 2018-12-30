@@ -14,7 +14,7 @@ import torch.distributed as dist
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-
+import numpy as np
 # import models
 from fp16util import *
 
@@ -109,6 +109,7 @@ def main():
     # but len device_ids will be 1
     #NOTE: We don't need distributed data paralle for the reason that we can't
     # do an all reduce so actual model will not be shared
+
     # if args.distributed: model = dist_utils.DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
     best_top5 = 93 # only save models over 93%. Otherwise it stops to save every time
 
@@ -186,6 +187,9 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
         # using total_process variable name to avoid conflict
         total_processes = dist_utils.env_world_size()
         # compute output
+        # print ("Type of input {}".format(input.dtype))
+        if not args.fp16:
+            input = input.float()
         output = model(input)
         loss = criterion(output, target)
 
@@ -202,6 +206,7 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
                 grad_val = param.grad.data
                 # converting grad val to cpu to use with current version of
                 grad_val = grad_val.cpu().numpy()
+                grad_val = grad_val.astype(np.float32)
                 encoded_dict = atomo.encode(grad_val)
                 u, s, vT, orig_size = (encoded_dict[key] for key in [
                     'u','s','vT', 'orig_size'])
@@ -214,33 +219,40 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
                 # norm it should be done at forward pass 
                 # shouldn't break the code but could effect the accuracy
                 # refer _sync_param for forward function in the DDP code
-                u = [torch.from_numpy(u).cuda(args.local_rank)]
-                s = [torch.from_numpy(s).cuda(args.local_rank)]
-                vT = [torch.from_numpy(vT).cuda(args.local_rank)]
+                u = [torch.from_numpy(u).cuda(args.local_rank).half()]
+                s = [torch.from_numpy(s).cuda(args.local_rank).half()]
+                vT = [torch.from_numpy(vT).cuda(args.local_rank).half()]
                 # based on the experiments and documentations we have to
                 # all_gather the three tensors differently
-                gather_u = [[ torch.zeros(u[0].shape).cuda(args.local_rank) for x in
+                gather_u = [[
+                    torch.zeros(u[0].shape).cuda(args.local_rank).half() for x in
                              range(total_processes)]]
                 # TODO: Make this async for pytorch 1.0
                 dist.all_gather_multigpu(gather_u, u)
-                gather_s = [[ torch.zeros(s[0].shape).cuda(args.local_rank) for x in 
+                gather_s = [[
+                    torch.zeros(s[0].shape).cuda(args.local_rank).half() for x in 
                              range(total_processes)]]
                 dist.all_gather_multigpu(gather_s, s)
-                gather_vT = [[ torch.zeros(vT[0].shape).cuda(args.local_rank) for x in range(total_processes)]]
+                gather_vT = [[
+                    torch.zeros(vT[0].shape).cuda(args.local_rank).half() for x in range(total_processes)]]
 
                 dist.all_gather_multigpu(gather_vT, vT)
 
-                collected_grad = torch.zeros(orig_size)
-                for idx, u_vec in enumerate(gather_u):
-                    s_vec = gather_s[idx]
-                    vT_vec = gather_vT[idx]
+                collected_grad = torch.zeros(orig_size).cuda().half()
+                for idx, u_vec in enumerate(gather_u[0]):
+                    s_vec = gather_s[0][idx]
+                    vT_vec = gather_vT[0][idx]
                     grad = torch.mm(torch.mm(u_vec, torch.diag(s_vec)), vT_vec)
                     grad = grad.view(orig_size)
                     collected_grad += grad
                 # avg the gradients
                 collected_grad /= total_processes
+                if 'bn' in name:
+                    # it's batch norm layer still in fp32
+                    collected_grad = collected_grad.float()
                 param.grad.data = collected_grad
             # atomo implementaion over
+
             model_grads_to_master_grads(model_params, master_params)
             for param in master_params: param.grad.data = param.grad.data/args.loss_scale
             optimizer.step()
@@ -282,10 +294,10 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
 
                 dist.all_gather_multigpu(gather_vT, vT)
 
-                collected_grad = torch.zeros(orig_size)
-                for idx, u_vec in enumerate(gather_u):
-                    s_vec = gather_s[idx]
-                    vT_vec = gather_vT[idx]
+                collected_grad = torch.zeros(orig_size).cuda()
+                for idx, u_vec in enumerate(gather_u[0]):
+                    s_vec = gather_s[0][idx]
+                    vT_vec = gather_vT[0][idx]
                     grad = torch.mm(torch.mm(u_vec, torch.diag(s_vec)), vT_vec)
                     grad = grad.view(orig_size)
                     collected_grad += grad
