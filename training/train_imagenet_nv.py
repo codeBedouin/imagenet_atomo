@@ -265,8 +265,15 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
             for name, param in model.named_parameters():
                 grad_val = param.grad.data
                 # converting grad val to cpu to use with current version of
+                tic = time.time()
                 grad_val = grad_val.cpu().numpy()
+                print ("Time to CPU {} on GPU {}".format(time.time()-tic,
+                                                         args.local_rank))
+                tic = time.time()
                 encoded_dict = atomo.encode(grad_val)
+                print ("Time for atomo encode {} on GPU {}".format(time.time()-tic, 
+                                                                   args.local_rank))
+                # tic = time.time()
                 u, s, vT, orig_size = (encoded_dict[key] for key in [
                     'u','s','vT', 'orig_size'])
                 # the assumption is that this is a numpy array let's prep all
@@ -277,23 +284,49 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
                 # norm it should be done at forward pass 
                 # shouldn't break the code but could effect the accuracy
                 # refer _sync_param for forward function in the DDP code
-                
+                tic = time.time()
                 u = [torch.from_numpy(u).cuda(args.local_rank)]
                 s = [torch.from_numpy(s).cuda(args.local_rank)]
                 vT = [torch.from_numpy(vT).cuda(args.local_rank)]
+                print ("Time for moving to GPU u, s, vT {} on GPU {}".format(
+                    time.time()-tic, args.local_rank))
                 # based on the experiments and documentations we have to
                 # all_gather the three tensors differently
-                gather_u = [[ torch.zeros(u[0].shape).cuda(args.local_rank) for x in
+                # TODO: Multi thread this thing  - Not sure about this 
+                tic = time.time()
+                gather_u = [[ torch.zeros(u[0].shape).cuda(args.local_rank,
+                                                           non_blocking=True) for x in
                              range(total_processes)]]
-                # TODO: Make this async for pytorch 1.0
+                print ("Time for creating buffers for u {} on GPU {}".format(
+                    time.time() - tic, args.local_rank))
+                # TODO: Make the all gathers async for pytorch 1.0
+                tic = time.time()
                 dist.all_gather_multigpu(gather_u, u)
-                gather_s = [[ torch.zeros(s[0].shape).cuda(args.local_rank) for x in 
+                print ("Time for gathering u {} on GPU {}".format(
+                    time.time()-tic, args.local_rank))
+                tic = time.time()
+                gather_s = [[ torch.zeros(s[0].shape).cuda(args.local_rank,
+                                                           non_blocking=True) for x in 
                              range(total_processes)]]
-                dist.all_gather_multigpu(gather_s, s)
-                gather_vT = [[ torch.zeros(vT[0].shape).cuda(args.local_rank) for x in range(total_processes)]]
 
+                print ("Time for creating buffers for s {} on GPU {}".format(
+                    time.time()-tic, args.local_rank))
+                tic = time.time()
+                dist.all_gather_multigpu(gather_s, s)
+                print ("Time for gathering s {} on GPU {}".format(
+                    time.time()-tic, args.local_rank))
+                tic = time.time()
+                gather_vT = [[ torch.zeros(vT[0].shape).cuda(args.local_rank,
+                                                             non_blocking=True) for x in range(total_processes)]]
+                print ("Time for creating buffers for vT {} on GPU {}".format(
+                    time.time()-tic, args.local_rank))
+                tic = time.time()
                 dist.all_gather_multigpu(gather_vT, vT)
 
+                print ("Time for gathering vT {} on GPU {}".format(
+                    time.time()-tic, args.local_rank))
+                
+                tic = time.time()
                 collected_grad = torch.zeros(orig_size).cuda()
                 for idx, u_vec in enumerate(gather_u[0]):
                     s_vec = gather_s[0][idx]
@@ -304,6 +337,8 @@ def train(trn_loader, model, criterion, optimizer, scheduler, epoch):
                 # avg the gradients
                 collected_grad /= total_processes
                 param.grad.data = collected_grad
+                print ("Time taken for decoding the final gradients {} on GPU{}".format(
+                    time.time()-tic, args.local_rank))
 
             optimizer.step()
 
